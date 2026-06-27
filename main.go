@@ -20,10 +20,10 @@ import (
 
 const (
 	nvidiaBase     = "https://integrate.api.nvidia.com/v1"
-	maxPerMinute   = 25    // 更保守，避免 NVIDIA 429
-	globalRate     = 3.0   // 5 keys × 25/min = 125/min ≈ 2/sec
+	maxPerMinute   = 50    // 拉满，每 key 50次/分钟
+	globalRate     = 5.0   // 5 keys × 50/min = 250/min ≈ 4/sec
 	listenAddr     = ":9099"
-	rateLimitBurst = 10    // 允许小突发
+	rateLimitBurst = 20    // 允许较大突发
 )
 
 type Config struct {
@@ -89,6 +89,8 @@ type keySlot struct {
 	key       string
 	count     int
 	windowEnd time.Time
+	lastUsed  time.Time
+	failCount int
 }
 
 type KeyPool struct {
@@ -115,24 +117,50 @@ func (p *KeyPool) Acquire() string {
 		p.mu.Lock()
 		now := time.Now()
 
+		// 智能选择：优先选最空闲的 key
+		bestIdx := -1
+		bestScore := -1
+
 		for i := 0; i < len(p.slots); i++ {
 			idx := (p.idx + i) % len(p.slots)
 			slot := p.slots[idx]
 
+			// 重置窗口
 			if now.After(slot.windowEnd) {
 				slot.count = 0
+				slot.failCount = 0
 				slot.windowEnd = now.Truncate(time.Minute).Add(time.Minute)
 			}
 
-			if slot.count < maxPerMinute {
-				slot.count++
-				p.idx = (idx + 1) % len(p.slots)
-				k := slot.key
-				p.mu.Unlock()
-				return k
+			// 计算分数：剩余配额 - 失败次数
+			remaining := maxPerMinute - slot.count
+			if remaining <= 0 {
+				continue
+			}
+
+			// 跳过最近失败的 key（冷却 5 秒）
+			if slot.failCount > 0 && now.Sub(slot.lastUsed) < 5*time.Second {
+				continue
+			}
+
+			score := remaining - slot.failCount*2
+			if score > bestScore {
+				bestScore = score
+				bestIdx = idx
 			}
 		}
 
+		if bestIdx >= 0 {
+			slot := p.slots[bestIdx]
+			slot.count++
+			slot.lastUsed = now
+			p.idx = (bestIdx + 1) % len(p.slots)
+			k := slot.key
+			p.mu.Unlock()
+			return k
+		}
+
+		// 所有 key 都满了，找最早重置的
 		earliest := p.slots[0].windowEnd
 		for _, s := range p.slots[1:] {
 			if s.windowEnd.Before(earliest) {
@@ -153,6 +181,18 @@ func (p *KeyPool) MarkExhausted(key string) {
 	for _, slot := range p.slots {
 		if slot.key == key {
 			slot.count = maxPerMinute
+			break
+		}
+	}
+}
+
+func (p *KeyPool) MarkFailed(key string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, slot := range p.slots {
+		if slot.key == key {
+			slot.failCount++
+			slot.lastUsed = time.Now()
 			break
 		}
 	}
@@ -650,6 +690,7 @@ func callNVIDIAStreaming(ctx context.Context, key, model string, messages []map[
 		}
 		if resp.StatusCode == 503 || resp.StatusCode == 429 {
 			resp.Body.Close()
+			pool.MarkFailed(key)
 			wait := time.Duration(5+retry*5) * time.Second
 			log.Printf("⏳ NVIDIA %d, retry %d/3 in %v...", resp.StatusCode, retry+1, wait)
 			time.Sleep(wait)
@@ -814,6 +855,7 @@ func callNVIDIA(ctx context.Context, key, model string, messages []map[string]in
 		}
 		if resp.StatusCode == 503 || resp.StatusCode == 429 {
 			resp.Body.Close()
+			pool.MarkFailed(key)
 			wait := time.Duration(5+retry*5) * time.Second
 			log.Printf("⏳ NVIDIA %d, retry %d/3 in %v...", resp.StatusCode, retry+1, wait)
 			time.Sleep(wait)
@@ -1042,6 +1084,7 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		if resp.StatusCode == 503 || resp.StatusCode == 429 {
 			resp.Body.Close()
+			pool.MarkFailed(usedKey)
 			wait := time.Duration(5+retry*5) * time.Second
 			log.Printf("⏳ [%d] NVIDIA %d, retry %d/3 in %v...", count, resp.StatusCode, retry+1, wait)
 			// 换一个 key 重试
