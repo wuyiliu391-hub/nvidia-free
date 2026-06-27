@@ -20,10 +20,10 @@ import (
 
 const (
 	nvidiaBase     = "https://integrate.api.nvidia.com/v1"
-	maxPerMinute   = 30    // 保守值，避免 429
-	globalRate     = 2.0   // 5 keys × 30/min = 150/min ≈ 2.5/sec
+	maxPerMinute   = 25    // 更保守，避免 NVIDIA 429
+	globalRate     = 3.0   // 5 keys × 25/min = 125/min ≈ 2/sec
 	listenAddr     = ":9099"
-	rateLimitBurst = 5     // 小突发
+	rateLimitBurst = 10    // 允许小突发
 )
 
 type Config struct {
@@ -953,13 +953,9 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 速率限制
+	// 速率限制（仅 key 池限制，不使用全局令牌桶）
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
-	if !rateLimiter.WaitNonBlocking(ctx) {
-		http.Error(w, "请求超时", http.StatusGatewayTimeout)
-		return
-	}
 
 	// 转换请求
 	messages, tools, _, err := responsesToChatMessages(body)
@@ -1026,10 +1022,6 @@ func chatHandler(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
-	if !rateLimiter.WaitNonBlocking(ctx) {
-		http.Error(w, "请求超时", http.StatusGatewayTimeout)
-		return
-	}
 
 	usedKey := pool.Acquire()
 	count := globalReqCount.Add(1)
