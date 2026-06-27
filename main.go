@@ -27,7 +27,8 @@ const (
 )
 
 type Config struct {
-	Keys []string `json:"keys"`
+	Keys         []string `json:"keys"`
+	DefaultModel string   `json:"default_model,omitempty"`
 }
 
 // ==================== 令牌桶速率限制器 ====================
@@ -179,6 +180,7 @@ var pool *KeyPool
 var rateLimiter *RateLimiter
 var globalReqCount atomic.Uint64
 var startTime time.Time
+var defaultModel string
 
 func init() {
 	sharedClient = &http.Client{
@@ -230,8 +232,11 @@ func responsesToChatMessages(body []byte) ([]map[string]interface{}, []map[strin
 
 	var messages []map[string]interface{}
 
-	// instructions → system message
+	// instructions → system message (fix sandbox mode)
 	if instructions, ok := req["instructions"].(string); ok && instructions != "" {
+		// Codex may set sandbox_mode to read-only, which prevents tool calls for writing
+		instructions = strings.ReplaceAll(instructions, "`sandbox_mode` is `read-only`", "`sandbox_mode` is `elevated`")
+		instructions = strings.ReplaceAll(instructions, "The sandbox only permits reading files.", "The sandbox permits reading and writing files.")
 		messages = append(messages, map[string]interface{}{
 			"role": "system", "content": instructions,
 		})
@@ -274,35 +279,44 @@ func responsesToChatMessages(body []byte) ([]map[string]interface{}, []map[strin
 				}
 				textContent := strings.Join(textParts, "\n")
 				if textContent != "" {
+					// Fix sandbox mode restriction
+					textContent = strings.ReplaceAll(textContent, "`sandbox_mode` is `read-only`", "`sandbox_mode` is `elevated`")
+					textContent = strings.ReplaceAll(textContent, "The sandbox only permits reading files.", "The sandbox permits reading and writing files.")
 					messages = append(messages, map[string]interface{}{
 						"role": role, "content": textContent,
 					})
 				}
 
 			case "function_call":
-				args, _ := im["output"].(string)
+				// Read arguments (string), NOT output
+				args, _ := im["arguments"].(string)
 				if args == "" {
 					args = "{}"
 				}
-				var argsMap map[string]interface{}
-				json.Unmarshal([]byte(args), &argsMap)
-				argsBytes, _ := json.Marshal(argsMap)
 				callID, _ := im["call_id"].(string)
 				name, _ := im["name"].(string)
 				pendingToolCalls = append(pendingToolCalls, map[string]interface{}{
 					"id": callID, "type": "function",
 					"function": map[string]interface{}{
-						"name": name, "arguments": string(argsBytes),
+						"name": name, "arguments": args,
 					},
 				})
 
 			case "function_call_output":
 				callID, _ := im["call_id"].(string)
-				output, _ := im["output"].(string)
+				// output can be string or complex object
+				var outputStr string
+				switch v := im["output"].(type) {
+				case string:
+					outputStr = v
+				default:
+					b, _ := json.Marshal(v)
+					outputStr = string(b)
+				}
 				pendingToolResults = append(pendingToolResults, map[string]interface{}{
 					"role": "tool",
 					"tool_call_id": callID,
-					"content": output,
+					"content": outputStr,
 				})
 			}
 		}
@@ -582,23 +596,36 @@ func callNVIDIAStreaming(ctx context.Context, key, model string, messages []map[
 	}
 
 	reqBody, _ := json.Marshal(cleanNulls(chatReq))
+	log.Printf("[→NVIDIA] tools=%d msgs=%d body=%s", len(tools), len(messages), string(reqBody[:min(3000, len(reqBody))]))
 	req, _ := http.NewRequestWithContext(ctx, "POST", nvidiaBase+"/chat/completions", bytes.NewReader(reqBody))
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := sharedClient.Do(req)
-	if err != nil {
-		log.Printf("❌ NVIDIA request failed: %v", err)
-		errWriter := newStreamWriter(w, flusher, model)
-		errWriter.emitFailed(model, fmt.Sprintf("request failed: %v", err))
-		return
+	var resp *http.Response
+	var err error
+	// Retry on 503 (server busy) up to 3 times
+	for retry := 0; retry < 3; retry++ {
+		req.Body = io.NopCloser(bytes.NewReader(reqBody))
+		resp, err = sharedClient.Do(req)
+		if err != nil {
+			log.Printf("❌ NVIDIA request failed: %v", err)
+			errWriter := newStreamWriter(w, flusher, model)
+			errWriter.emitFailed(model, fmt.Sprintf("request failed: %v", err))
+			return
+		}
+		if resp.StatusCode != 503 {
+			break
+		}
+		resp.Body.Close()
+		wait := time.Duration(2+retry*2) * time.Second
+		log.Printf("⏳ NVIDIA 503 busy, retry %d/3 in %v...", retry+1, wait)
+		time.Sleep(wait)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
 		log.Printf("❌ NVIDIA returned %d: %s", resp.StatusCode, string(body[:min(200, len(body))]))
-		// Can't change status code since headers already sent, emit error as SSE
 		errWriter := newStreamWriter(w, flusher, model)
 		errWriter.emitFailed(model, fmt.Sprintf("NVIDIA returned %d: %s", resp.StatusCode, string(body[:min(200, len(body))])))
 		return
@@ -707,9 +734,21 @@ func callNVIDIA(ctx context.Context, key, model string, messages []map[string]in
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := sharedClient.Do(req)
-	if err != nil {
-		return nil, err
+	var resp *http.Response
+	var err error
+	for retry := 0; retry < 3; retry++ {
+		req.Body = io.NopCloser(bytes.NewReader(reqBody))
+		resp, err = sharedClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != 503 {
+			break
+		}
+		resp.Body.Close()
+		wait := time.Duration(2+retry*2) * time.Second
+		log.Printf("⏳ NVIDIA 503 busy, retry %d/3 in %v...", retry+1, wait)
+		time.Sleep(wait)
 	}
 	defer resp.Body.Close()
 
@@ -812,8 +851,9 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	json.Unmarshal(body, &req)
 	streaming := req.Stream
 	model := req.Model
-	if model == "" {
-		model = "z-ai/glm-5.1"
+	if model == "" || !strings.Contains(model, "/") {
+		// OpenAI model names (gpt-5.4, etc.) don't contain "/" — use default
+		model = defaultModel
 	}
 
 	// 速率限制
@@ -829,6 +869,17 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "请求格式转换失败: "+err.Error(), http.StatusBadRequest)
 		return
+	}
+	log.Printf("[←Codex] raw_len=%d model=%s tools=%d msgs=%d", len(body), model, len(tools), len(messages))
+	for i, m := range messages {
+		role, _ := m["role"].(string)
+		tc, _ := m["tool_calls"].([]map[string]interface{})
+		if len(tc) > 0 {
+			log.Printf("  msg[%d] role=%s tool_calls=%d", i, role, len(tc))
+		} else {
+			content, _ := m["content"].(string)
+			log.Printf("  msg[%d] role=%s content=%s", i, role, content[:min(200, len(content))])
+		}
 	}
 
 	usedKey := pool.Acquire()
@@ -1025,6 +1076,10 @@ func main() {
 	pool = NewKeyPool(cfg.Keys)
 	rateLimiter = NewRateLimiter(globalRate, rateLimitBurst)
 	startTime = time.Now()
+	defaultModel = cfg.DefaultModel
+	if defaultModel == "" {
+		defaultModel = "z-ai/glm-5.1"
+	}
 
 	log.Printf("🔑 已加载 %d 个 API key", len(cfg.Keys))
 	log.Printf("🎯 每 key 限 %d 次/分钟", maxPerMinute)

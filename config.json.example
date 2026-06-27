@@ -2,5 +2,7 @@
   "keys": [
     "nvapi-your-key-1",
     "nvapi-your-key-2"
-  ]
+  ],
+  "default_model": "z-ai/glm-5.1"
 }
+
