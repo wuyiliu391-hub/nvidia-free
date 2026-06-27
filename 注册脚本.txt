@@ -1,0 +1,422 @@
+// ==UserScript==
+// @name         NVIDIA Build Key Helper
+// @namespace    http://tampermonkey.net/
+// @version      0.2.0
+// @description  Visual one-click helper for the two-step request flow on build.nvidia.com
+// @match        https://build.nvidia.com/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const PANEL_ID = 'nvidia-build-key-helper-panel';
+  const RESULT_ID = 'nvidia-build-key-helper-result';
+  const STATUS_ID = 'nvidia-build-key-helper-status';
+  const RUN_BUTTON_ID = 'nvidia-build-key-helper-run';
+  const COPY_BUTTON_ID = 'nvidia-build-key-helper-copy';
+  const COPY_API_KEY_BUTTON_ID = 'nvidia-build-key-helper-copy-api-key';
+  const CLEAR_BUTTON_ID = 'nvidia-build-key-helper-clear';
+  const TOGGLE_BUTTON_ID = 'nvidia-build-key-helper-toggle';
+  const BODY_ID = 'nvidia-build-key-helper-body';
+
+  let isRunning = false;
+  let lastResultText = '';
+  let lastApiKeyValue = '';
+
+  function formatResult(value) {
+    if (typeof value === 'string') {
+      return value;
+    }
+
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch (error) {
+      return String(value);
+    }
+  }
+
+  function setStatus(type, text) {
+    const statusEl = document.getElementById(STATUS_ID);
+    if (!statusEl) {
+      return;
+    }
+
+    statusEl.textContent = text;
+    statusEl.setAttribute('data-state', type);
+  }
+
+  function setResult(value) {
+    lastResultText = formatResult(value);
+    lastApiKeyValue = value?.result?.apiKey?.value || '';
+
+    const resultEl = document.getElementById(RESULT_ID);
+    if (!resultEl) {
+      return;
+    }
+
+    resultEl.textContent = lastResultText;
+  }
+
+  function setRunningState(running) {
+    isRunning = running;
+
+    const runButton = document.getElementById(RUN_BUTTON_ID);
+    const copyButton = document.getElementById(COPY_BUTTON_ID);
+    const copyApiKeyButton = document.getElementById(COPY_API_KEY_BUTTON_ID);
+    if (runButton) {
+      runButton.disabled = running;
+      runButton.textContent = running ? '执行中...' : '一键执行';
+    }
+
+    if (copyButton) {
+      copyButton.disabled = running || !lastResultText;
+    }
+
+    if (copyApiKeyButton) {
+      copyApiKeyButton.disabled = running || !lastApiKeyValue;
+    }
+  }
+
+  async function safeReadResponse(response) {
+    const contentType = response.headers.get('content-type') || '';
+
+    if (contentType.includes('application/json')) {
+      return response.json();
+    }
+
+    return response.text();
+  }
+
+  async function runFlow() {
+    if (isRunning) {
+      return;
+    }
+
+    setRunningState(true);
+    setStatus('running', '正在执行第 1 步...');
+    setResult('');
+
+    try {
+      const step1Res = await fetch('https://api.ngc.nvidia.com/user-context', {
+        method: 'GET',
+        credentials: 'include',
+        headers: {
+          accept: 'application/json, text/plain, */*',
+        },
+      });
+
+      const step1Data = await safeReadResponse(step1Res);
+
+      if (!step1Res.ok) {
+        throw new Error(`第 1 步请求失败: ${step1Res.status} ${step1Res.statusText}\n${formatResult(step1Data)}`);
+      }
+
+      const orgName = step1Data?.orgName;
+      if (!orgName) {
+        throw new Error(`第 1 步返回中未找到 orgName 字段:\n${formatResult(step1Data)}`);
+      }
+
+      setStatus('running', '正在执行第 2 步...');
+
+      const step2Url = `https://api.ngc.nvidia.com/v3/orgs/${orgName}/keys/type/AI_PLAYGROUNDS_KEY`;
+      const payload = {
+        expiryDate: '2126-04-08T07:00:00Z',
+        name: 'dev',
+        type: 'AI_PLAYGROUNDS_KEY',
+        policies: [
+          {
+            product: 'nv-cloud-functions',
+            scopes: ['invoke_function'],
+            resources: [{ id: '*', type: 'account-functions' }],
+          },
+        ],
+      };
+
+      const step2Res = await fetch(step2Url, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          accept: '*/*',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+
+      const step2Data = await safeReadResponse(step2Res);
+
+      if (!step2Res.ok) {
+        throw new Error(`第 2 步请求失败: ${step2Res.status} ${step2Res.statusText}\n${formatResult(step2Data)}`);
+      }
+
+      const finalResult = {
+        success: true,
+        orgName,
+        result: step2Data,
+      };
+
+      setResult(finalResult);
+      setStatus('success', '执行完成，已输出最终结果');
+      console.log('最终请求结果：', finalResult);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus('error', '执行失败');
+      setResult({ success: false, error: message });
+      console.error('执行失败：', error);
+    } finally {
+      setRunningState(false);
+    }
+  }
+
+  async function copyResult() {
+    if (!lastResultText) {
+      setStatus('idle', '暂无可复制结果');
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(lastResultText);
+      setStatus('success', '结果已复制到剪贴板');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus('error', '复制失败');
+      console.error('复制失败：', message);
+    }
+  }
+
+  async function copyApiKeyValue() {
+    if (!lastApiKeyValue) {
+      setStatus('idle', '未找到 apiKey.value');
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(lastApiKeyValue);
+      setStatus('success', 'apiKey.value 已复制到剪贴板');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus('error', '复制 apiKey.value 失败');
+      console.error('复制 apiKey.value 失败：', message);
+    }
+  }
+
+  function clearResult() {
+    lastResultText = '';
+    lastApiKeyValue = '';
+    setResult('');
+    setStatus('idle', '已清空结果');
+    setRunningState(false);
+  }
+
+  function togglePanelBody() {
+    const bodyEl = document.getElementById(BODY_ID);
+    const toggleButton = document.getElementById(TOGGLE_BUTTON_ID);
+    if (!bodyEl || !toggleButton) {
+      return;
+    }
+
+    const isHidden = bodyEl.hidden;
+    bodyEl.hidden = !isHidden;
+    toggleButton.textContent = isHidden ? '收起' : '展开';
+  }
+
+  function createStyles() {
+    const style = document.createElement('style');
+    style.textContent = `
+      #${PANEL_ID} {
+        position: fixed;
+        top: 50%;
+        right: 20px;
+        transform: translateY(-50%);
+        z-index: 999999;
+        width: 420px;
+        color: #e5e7eb;
+        background: rgba(15, 23, 42, 0.96);
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        border-radius: 16px;
+        box-shadow: 0 18px 50px rgba(0, 0, 0, 0.35);
+        backdrop-filter: blur(12px);
+        font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      }
+
+      #${PANEL_ID} * {
+        box-sizing: border-box;
+      }
+
+      #${PANEL_ID} button {
+        border: 0;
+        border-radius: 10px;
+        padding: 10px 14px;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: opacity 0.2s ease, transform 0.2s ease, background 0.2s ease;
+      }
+
+      #${PANEL_ID} button:hover:not(:disabled) {
+        transform: translateY(-1px);
+      }
+
+      #${PANEL_ID} button:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+
+      #${PANEL_ID} .helper-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 14px 16px;
+        border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+      }
+
+      #${PANEL_ID} .helper-title {
+        font-size: 15px;
+        font-weight: 700;
+      }
+
+      #${PANEL_ID} .helper-status {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+        color: #cbd5e1;
+        margin-top: 6px;
+      }
+
+      #${PANEL_ID} .helper-status::before {
+        content: '';
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: #94a3b8;
+      }
+
+      #${STATUS_ID}[data-state="idle"]::before {
+        background: #94a3b8;
+      }
+
+      #${STATUS_ID}[data-state="running"]::before {
+        background: #f59e0b;
+      }
+
+      #${STATUS_ID}[data-state="success"]::before {
+        background: #22c55e;
+      }
+
+      #${STATUS_ID}[data-state="error"]::before {
+        background: #ef4444;
+      }
+
+      #${BODY_ID} {
+        padding: 16px;
+      }
+
+      #${PANEL_ID} .helper-actions {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+        margin-bottom: 14px;
+      }
+
+      #${RUN_BUTTON_ID} {
+        background: linear-gradient(135deg, #2563eb, #3b82f6);
+        color: #fff;
+      }
+
+      #${COPY_BUTTON_ID} {
+        background: rgba(59, 130, 246, 0.14);
+        color: #bfdbfe;
+      }
+
+      #${COPY_API_KEY_BUTTON_ID} {
+        background: rgba(16, 185, 129, 0.14);
+        color: #a7f3d0;
+      }
+
+      #${CLEAR_BUTTON_ID} {
+        background: rgba(148, 163, 184, 0.14);
+        color: #e2e8f0;
+      }
+
+      #${TOGGLE_BUTTON_ID} {
+        background: rgba(148, 163, 184, 0.14);
+        color: #e2e8f0;
+        padding: 8px 12px;
+      }
+
+      #${RESULT_ID} {
+        min-height: 240px;
+        max-height: 420px;
+        overflow: auto;
+        margin: 0;
+        padding: 14px;
+        border-radius: 12px;
+        background: rgba(2, 6, 23, 0.75);
+        border: 1px solid rgba(148, 163, 184, 0.12);
+        color: #dbeafe;
+        font-size: 12px;
+        line-height: 1.6;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      #${PANEL_ID} .helper-tip {
+        margin-top: 10px;
+        font-size: 12px;
+        color: #94a3b8;
+      }
+    `;
+
+    document.head.appendChild(style);
+  }
+
+  function createPanel() {
+    if (document.getElementById(PANEL_ID)) {
+      return;
+    }
+
+    createStyles();
+
+    const panel = document.createElement('section');
+    panel.id = PANEL_ID;
+    panel.innerHTML = `
+      <div class="helper-header">
+        <div>
+          <div class="helper-title">NVIDIA Build Helper</div>
+          <div id="${STATUS_ID}" class="helper-status" data-state="idle">等待执行</div>
+        </div>
+        <button id="${TOGGLE_BUTTON_ID}" type="button">收起</button>
+      </div>
+      <div id="${BODY_ID}">
+        <div class="helper-actions">
+          <button id="${RUN_BUTTON_ID}" type="button">一键执行</button>
+          <button id="${COPY_BUTTON_ID}" type="button" disabled>复制结果</button>
+          <button id="${COPY_API_KEY_BUTTON_ID}" type="button" disabled>复制 apiKey.value</button>
+          <button id="${CLEAR_BUTTON_ID}" type="button">清空</button>
+        </div>
+        <pre id="${RESULT_ID}">点击"一键执行"后，这里会显示最终结果。</pre>
+        <div class="helper-tip">脚本仅在 https://build.nvidia.com/ 域名下生效。</div>
+      </div>
+    `;
+
+    document.body.appendChild(panel);
+
+    document.getElementById(RUN_BUTTON_ID)?.addEventListener('click', runFlow);
+    document.getElementById(COPY_BUTTON_ID)?.addEventListener('click', copyResult);
+    document.getElementById(COPY_API_KEY_BUTTON_ID)?.addEventListener('click', copyApiKeyValue);
+    document.getElementById(CLEAR_BUTTON_ID)?.addEventListener('click', clearResult);
+    document.getElementById(TOGGLE_BUTTON_ID)?.addEventListener('click', togglePanelBody);
+  }
+
+  function init() {
+    createPanel();
+  }
+
+  if (document.readyState === 'loading') {
+    window.addEventListener('DOMContentLoaded', init, { once: true });
+  } else {
+    init();
+  }
+})();
